@@ -41,32 +41,37 @@ HubSpot Workflow ──► Webhook (HubSpot) ──► Validate Payload ──�
        Parse Agent Output → Skip / Low-confidence? (gate)
                        │
                        ▼
-       Store in Queue (Code, $workflow.staticData)  ◄── webhook path
-                                                       TERMINATES here.
-                                                       No Slack, no writeback.
-                                                       Queue grows during week.
+       HubSpot: Store Pending Signal  ◄── webhook path TERMINATES here.
+       (HTTP PATCH → company.            Writes the slim agent output to a
+        pending_upsell_signal_json)      HubSpot company property.
+                                         No Slack, no writeback to other props.
 
 
                                     MONDAY 9AM ET PATH
                                     --------------------
 
-Schedule Trigger (cron 0 9 * * 1) ──► Read Queue & Top 30 (Code)
-                                              │
-                                              │ sorts pending by score desc,
-                                              │ slices top 30,
-                                              │ clears those entries,
-                                              │ emits 0–30 items.
-                                              ▼
-                                      Format Slack Blocks ──► Slack: Post  ──► #upsell-agent
-                                                                       │
-                                                                       ▼
-                                                            HubSpot: Update Company
-                                                                  (writeback)
+Schedule Trigger (cron 0 9 * * 1)
+        │
+        ▼
+HubSpot: Search Pending (HTTP search on pending_upsell_signal_json HAS_PROPERTY, limit 200)
+        │
+        ▼
+Parse & Top 30 (Code: JSON.parse each company's pending payload,
+                       sort by score desc, slice top 30, emit one item per)
+        │
+        ▼
+Format Slack Blocks ──► Slack: Post  ──► #upsell-agent
+                                  │
+                                  ▼
+                       HubSpot: Update Company
+                       (writeback: sets last_upsell_alert_*,
+                        increments upsell_alert_count_lifetime,
+                        CLEARS pending_upsell_signal_json)
 ```
 
 ### Why two paths
 
-The workflow runs the **full scoring + agent reasoning real-time** whenever HubSpot's internal Workflow posts a `company_id`. But instead of posting to Slack immediately and spamming CSMs throughout the week, the result is **queued** in `$workflow.staticData`. Every Monday at 9am ET, a Schedule trigger reads the queue, picks the top 20–30 by heat score, posts those to Slack as a digest review for AMs, and writes back to HubSpot. Old queue entries auto-expire after 7 days.
+The workflow runs the **full scoring + agent reasoning real-time** whenever HubSpot's internal Workflow posts a `company_id`. But instead of posting to Slack immediately and spamming CSMs throughout the week, the result is **stored on the company's HubSpot record** in the `pending_upsell_signal_json` property. Every Monday at 9am ET, a Schedule trigger queries HubSpot for all companies with this property set, parses the stored payload, picks the top 20–30 by heat score, posts to Slack as a digest review for AMs, and writes back to HubSpot (clearing the pending property in the same call).
 
 This split gives CSMs a **predictable Monday-morning review session** rather than unpredictable real-time pings, while still using fresh agent reasoning (done at signal time, not on Monday).
 
@@ -92,22 +97,25 @@ The agent's prompt has three sections:
 - A **user message** with the full account dump, scoring breakdown, opportunity list, last-run memory, and the top-5 contacts.
 - The model returns JSON only, with `responseMimeType: application/json` enforced server-side.
 
-**Parse + queue (real-time path).** `Parse Agent Output` is a JS Code node that extracts the JSON from the agent's response, validates the keys, builds a one-line `last_alert_summary` for the writeback, and computes `new_alert_count` (existing count + 1). `Skip / Low-confidence?` drops runs where the agent set `skip_reason` or returned `confidence: low`. Surviving runs go to `Store in Queue`, a Code node that pushes the full parsed bundle (companyId, company, score, agent JSON, and all derived fields) into `$workflow.staticData.pending` with a timestamp. Old entries (older than 7 days) are auto-trimmed on each write. The webhook path **ends here** — no Slack post, no HubSpot writeback in real time.
+**Parse + queue (real-time path).** `Parse Agent Output` is a JS Code node that extracts the JSON from the agent's response, validates the keys, builds a one-line `last_alert_summary` for the writeback, and computes `new_alert_count` (existing count + 1). `Skip / Low-confidence?` drops runs where the agent set `skip_reason` or returned `confidence: low`. Surviving runs go to `HubSpot: Store Pending Signal`, an HTTP PATCH that writes a slim version of the agent output (score, motion, recommended_product, why_now, reasoning, best_contact_*, suggested_opener, confidence, and minimal company context) as JSON into the company's `pending_upsell_signal_json` property. The webhook path **ends here** — no Slack post, no other HubSpot writes in real time.
 
-**Monday digest (schedule path).** Every Monday at 9am ET, the `Schedule (Mon 9am ET)` trigger fires (cron `0 9 * * 1`, timezone `America/New_York`). `Read Queue & Top 30` reads `$workflow.staticData.pending`, applies the 7-day TTL filter, sorts by `score` descending, slices the top 30, and removes those entries from the queue. It then emits one item per surviving company in the same shape `Parse Agent Output` produces. Each item flows through `Format Slack Blocks` → `Slack: Post message` → `HubSpot: Update Company`.
+**Monday digest (schedule path).** Every Monday at 9am ET, the `Schedule (Mon 9am ET)` trigger fires (cron `0 9 * * 1`, timezone `America/New_York`). `HubSpot: Search Pending` calls HubSpot's CRM search API with the filter `pending_upsell_signal_json HAS_PROPERTY`, returning up to 200 companies that have a pending signal. `Parse & Top 30` is a Code node that JSON-parses each company's stored payload, sorts the collection by `score` descending, slices the top 30, and emits one item per surviving company. Each item flows through `Format Slack Blocks` → `Slack: Post message` → `HubSpot: Update Company` (which also clears `pending_upsell_signal_json` on that company so it doesn't get re-posted next Monday).
 
 **Slack format.** `Format Slack Blocks` builds a Block Kit payload with a header, fields (motion, confidence, product, score), the why-now line, the best-contact section, the reasoning paragraph, the suggested opener, and three action buttons (👍 / 👎 / Open in HubSpot). `Slack: Post message` POSTs to `chat.postMessage`.
 
-**Writeback.** `HubSpot: Update Company` PATCHes four properties on the company record: `last_upsell_alert_sent` (timestamp), `last_upsell_alert_product` (the recommended product), `last_upsell_alert_outcome` (one-line summary, e.g. `cross-sell MEC · medium confidence · 2026-05-19`), and `upsell_alert_count_lifetime` (incremented).
+**Writeback.** `HubSpot: Update Company` PATCHes five properties on the company record: `last_upsell_alert_sent` (timestamp), `last_upsell_alert_product` (the recommended product), `last_upsell_alert_outcome` (one-line summary, e.g. `cross-sell MEC · medium confidence · 2026-05-19`), `upsell_alert_count_lifetime` (incremented), and `pending_upsell_signal_json` (cleared to empty string so it doesn't get re-posted next Monday).
 
-### Why staticData instead of a HubSpot property for the queue
+### Why a HubSpot property for the queue (not n8n staticData)
 
-The queue lives in n8n's `$workflow.staticData` — a workflow-scoped persistent object that survives executions and restarts. Two reasons:
+The queue lives on the HubSpot company record in a `pending_upsell_signal_json` multi-line text property. Reasons:
 
-- **No new HubSpot property required.** Avoids adding another custom property to the Company object just for queueing.
-- **Self-contained.** The queue is fully owned by this workflow. Easy to inspect via the n8n UI (Code node output panels) and reason about.
+- **Visible in HubSpot.** CSMs can inspect what's pending for any company mid-week.
+- **Durable.** Survives n8n workflow recreations, deployments, version changes.
+- **Queryable.** HubSpot's search API is the natural way to fetch "all companies with a pending signal" on Monday.
 
-Trade-off: the queue isn't visible to CSMs in HubSpot mid-week. If pre-Monday visibility is needed, swap to a multi-line text property like `pending_upsell_signal_json` — same logic, persistent on the company record.
+This swap was forced — an earlier attempt to use n8n's `$workflow.staticData` failed because the running n8n version's JS task runner doesn't expose static-data persistence to Code nodes. The HubSpot-property approach is architecturally cleaner anyway.
+
+**Required HubSpot setup:** create one custom property on the Company object — `pending_upsell_signal_json`, type **multi-line text**, internal name exactly `pending_upsell_signal_json`. Without this property the webhook path errors with `PROPERTY_DOESNT_EXIST`.
 
 ### Memory model — 1 run back, lives in HubSpot
 
