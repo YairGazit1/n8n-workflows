@@ -101,7 +101,39 @@ The agent's prompt has three sections:
 
 **Monday digest (schedule path).** Every Monday at 9am ET, the `Schedule (Mon 9am ET)` trigger fires (cron `0 9 * * 1`, timezone `America/New_York`). `HubSpot: Search Pending` calls HubSpot's CRM search API with the filter `pending_upsell_signal_json HAS_PROPERTY`, returning up to 200 companies that have a pending signal. `Parse & Top 30` is a Code node that JSON-parses each company's stored payload, sorts the collection by `score` descending, slices the top 30, and emits one item per surviving company. Each item flows through `Format Slack Blocks` → `Slack: Post message` → `HubSpot: Update Company` (which also clears `pending_upsell_signal_json` on that company so it doesn't get re-posted next Monday).
 
-**Slack format.** `Format Slack Blocks` builds a Block Kit payload with a header, fields (motion, confidence, product, score), the why-now line, the best-contact section, the reasoning paragraph, the suggested opener, and three action buttons (👍 / 👎 / Open in HubSpot). `Slack: Post message` POSTs to `chat.postMessage`.
+**Slack format.** `Format Slack Blocks` builds a Block Kit payload. From top to bottom:
+- An `@-mention` block: if the AM was resolved to a Slack user (`am_slack_id`), this is `<@U0XYZ> — new upsell signal for *Acme Corp*` so Slack pings them. Otherwise it's plain text `*New upsell signal for Acme Corp*`.
+- A header with the company name (🎯).
+- Fields row: motion, confidence (🟢🟡🔴), recommended product, heat score.
+- AM line + leading 4C theme.
+- Why-Now section.
+- Best Contact section.
+- Reasoning paragraph.
+- Suggested Opener (block-quoted).
+- **📧 Email Draft section** — `Subject: <subject>` and the full ~150-word body, rendered inside a Slack code block (triple-backticks) so AMs get a one-click copy button and can paste straight into Gmail.
+- Health context footer + 👍/👎 buttons + Open in HubSpot.
+
+`Slack: Post message` POSTs to `chat.postMessage`.
+
+### AM @-tagging (resolution path)
+
+The agent's output doesn't know Slack user IDs. The webhook path resolves them on the fly so every queued signal carries the right `am_slack_id`:
+
+1. `HubSpot: Get Company` now also pulls `account_manager_full_name` (the property holds the AM's full name as text).
+2. After `Skip / Low-confidence?` passes, two new nodes run:
+   - `Slack: Lookup Users` — calls Slack's `users.list` API (requires `users:read` scope on the bot credential). Returns the workspace's full member list once per webhook execution.
+   - `Resolve AM Slack ID` — a Code node that matches `account_manager_full_name` against each member's `real_name` and `profile.display_name` (case-insensitive). On match, sets `am_slack_id`. On no match, leaves it empty.
+3. The resolved `am_full_name` and `am_slack_id` are persisted into `pending_upsell_signal_json` so Monday's Slack render uses them without another lookup.
+
+If a company's `account_manager_full_name` is empty, or no Slack member matches, the message still posts to `#upsell-agent` — just without a mention (no notification, but the signal is visible to anyone watching the channel).
+
+### Email draft (agent-generated)
+
+The AI Agent's prompt was extended with a `# EMAIL DRAFT — REQUIRED` section. The JSON output now includes two new fields:
+- `email_subject` — 5–10 words, specific (e.g. "Pershing Square — MEC automation question"), no clickbait.
+- `email_body` — ~150 words, plain text, friendly+consultative. Opens with a public-signal hook (anonymity rule applied — never "I saw you on our website"), one paragraph on why the product fits, soft CTA ("Would 20 min next week work?"), signs off with `Best,\n[Your Name]` so the AM types their own name.
+
+The body is rendered in the Slack message as a code block — AMs hit Slack's copy button, paste into Gmail compose, edit `[Your Name]`, send.
 
 **Writeback.** `HubSpot: Update Company` PATCHes five properties on the company record: `last_upsell_alert_sent` (timestamp), `last_upsell_alert_product` (the recommended product), `last_upsell_alert_outcome` (one-line summary, e.g. `cross-sell MEC · medium confidence · 2026-05-19`), `upsell_alert_count_lifetime` (incremented), and `pending_upsell_signal_json` (cleared to empty string so it doesn't get re-posted next Monday).
 
@@ -160,6 +192,8 @@ If `skip_reason` is set or `confidence` is `low`, the workflow short-circuits be
 
 ### What's deferred
 
+- **AM Slack ID property on HubSpot.** Adding a `am_slack_user_id` text property on the Company and writing the Slack ID into it once would let us skip the runtime Slack `users.list` lookup entirely. More reliable than the case-insensitive name match.
+- **Auto-send the email (Phase 2).** Today AMs copy-paste the agent's email draft into Gmail manually. Phase 2 wires up Gmail's send-as-user API to send automatically on behalf of the AM. Separate workflow, separate planning.
 - **LinkedIn research tool.** Datarails doesn't have approved API access to Tavily/SerpAPI/Apollo for company research; live LinkedIn fetching via Jina was unreliable. Deferred until a vendor is approved.
 - **Salesforce-backed opportunities.** The original design pulled SF Account Owner + Opportunities via SOQL. Currently uses HubSpot deals as a stand-in. Swap to a Salesforce HTTP Request node when SF OAuth credentials are wired.
 - **15-run memory.** Current model stores 1 run back in standard HubSpot properties. Extending to 15 runs requires a new `recent_upsell_signals` multi-line text property on the Company object.
