@@ -21,56 +21,58 @@ A HubSpot-triggered workflow that analyzes a Datarails customer, scores their li
 ### Architecture
 
 ```
-                              ┌────────────────────────┐
-HubSpot Workflow (per company)│ Webhook (HubSpot)      │
-       │                      └───────────┬────────────┘
-       │ POST company_id                  ▼
-       │                      ┌────────────────────────┐
-       │                      │ Validate Payload       │
-       │                      │ Has companyId?         │
-       │                      └───────────┬────────────┘
-       │                                  ▼
-       │              ┌───────────────────┴────────────────────┐
-       │              │  HubSpot: Get Company (55 properties)  │
-       │              │  HubSpot: Search Contacts (top 7)      │
-       │              │  HubSpot: Search Deals (by company)    │
-       │              └───────────────────┬────────────────────┘
-       │                                  ▼
-       │                      ┌────────────────────────┐
-       │                      │ Build Score Input      │
-       │                      │ Score Engine (JS)      │
-       │                      │ Score ≥ 40? (gate)     │
-       │                      └───────────┬────────────┘
-       │                                  ▼
-       │                      ┌────────────────────────┐
-       │                      │ Build Agent Bundle     │
-       │                      └───────────┬────────────┘
-       │                                  ▼
-       │                      ┌────────────────────────┐
-       │                      │ AI Agent               │◄── Gemini Chat Model
-       │                      │   (n8n LangChain)      │    (via OpenAI compat)
-       │                      └───────────┬────────────┘
-       │                                  │
-       │                                  │  ◄── Datarails_Fetch_URL tool
-       │                                  ▼      (agent calls on demand)
-       │                      ┌────────────────────────┐
-       │                      │ Parse Agent Output     │
-       │                      │ Skip / Low confidence? │
-       │                      └───────────┬────────────┘
-       │                                  ▼
-       │                      ┌────────────────────────┐
-       │                      │ Format Slack Blocks    │
-       │                      │ Slack: Post message    │  ──► #upsell-agent
-       │                      └───────────┬────────────┘
-       │                                  ▼
-       │                      ┌────────────────────────┐
-       │                      │ HubSpot: Update Company│  (writeback)
-       │                      └────────────────────────┘
+                                    REAL-TIME PATH (any time)
+                                    --------------------------
+
+HubSpot Workflow ──► Webhook (HubSpot) ──► Validate Payload ──► Has companyId?
+                                                                        │
+                       ┌───────────────────────────────────────────────┘
+                       ▼
+       HubSpot: Get Company → Search Contacts → Search Deals
+                       │
+                       ▼
+       Build Score Input → Score Engine (JS) → Score ≥ 40? (gate)
+                       │
+                       ▼
+       Build Agent Bundle → AI Agent ◄── Gemini Chat Model (OpenAI compat)
+                                    ◄── Datarails_Fetch_URL tool
+                       │
+                       ▼
+       Parse Agent Output → Skip / Low-confidence? (gate)
+                       │
+                       ▼
+       Store in Queue (Code, $workflow.staticData)  ◄── webhook path
+                                                       TERMINATES here.
+                                                       No Slack, no writeback.
+                                                       Queue grows during week.
+
+
+                                    MONDAY 9AM ET PATH
+                                    --------------------
+
+Schedule Trigger (cron 0 9 * * 1) ──► Read Queue & Top 30 (Code)
+                                              │
+                                              │ sorts pending by score desc,
+                                              │ slices top 30,
+                                              │ clears those entries,
+                                              │ emits 0–30 items.
+                                              ▼
+                                      Format Slack Blocks ──► Slack: Post  ──► #upsell-agent
+                                                                       │
+                                                                       ▼
+                                                            HubSpot: Update Company
+                                                                  (writeback)
 ```
+
+### Why two paths
+
+The workflow runs the **full scoring + agent reasoning real-time** whenever HubSpot's internal Workflow posts a `company_id`. But instead of posting to Slack immediately and spamming CSMs throughout the week, the result is **queued** in `$workflow.staticData`. Every Monday at 9am ET, a Schedule trigger reads the queue, picks the top 20–30 by heat score, posts those to Slack as a digest review for AMs, and writes back to HubSpot. Old queue entries auto-expire after 7 days.
+
+This split gives CSMs a **predictable Monday-morning review session** rather than unpredictable real-time pings, while still using fresh agent reasoning (done at signal time, not on Monday).
 
 ### Stages explained
 
-**Trigger & validation.** HubSpot posts `{ "company_id": "<id>" }` to the webhook. `Validate Payload` extracts the ID; `Has companyId?` routes empty payloads to a no-op.
+**Trigger & validation (real-time path).** HubSpot posts `{ "company_id": "<id>" }` to the webhook. `Validate Payload` extracts the ID; `Has companyId?` routes empty payloads to a no-op.
 
 **Data pull (HubSpot only).** Three HTTP calls in series, all using the shared HubSpot App Token credential:
 - `HubSpot: Get Company` — ~50 properties including journey stage, status fields, G2 buyer-intent fields, Warmly fields, HubSpot intent fields, owned-product flags (`fp_a_active`, `month_end_close_active`, etc.), renewal date, and the upsell-history properties (`last_upsell_alert_*`, `upsell_alert_count_lifetime`).
@@ -90,9 +92,22 @@ The agent's prompt has three sections:
 - A **user message** with the full account dump, scoring breakdown, opportunity list, last-run memory, and the top-5 contacts.
 - The model returns JSON only, with `responseMimeType: application/json` enforced server-side.
 
-**Signaling.** `Parse Agent Output` is a JS Code node that extracts the JSON from the agent's response, validates the keys, builds a one-line `last_alert_summary` for the writeback, and computes `new_alert_count` (existing count + 1). `Skip / Low-confidence?` drops runs where the agent set `skip_reason` or returned `confidence: low`. `Format Slack Blocks` builds a Block Kit payload with a header, fields (motion, confidence, product, score), the why-now line, the best-contact section, the reasoning paragraph, the suggested opener, and three action buttons (👍 / 👎 / Open in HubSpot). `Slack: Post message` POSTs to `chat.postMessage`.
+**Parse + queue (real-time path).** `Parse Agent Output` is a JS Code node that extracts the JSON from the agent's response, validates the keys, builds a one-line `last_alert_summary` for the writeback, and computes `new_alert_count` (existing count + 1). `Skip / Low-confidence?` drops runs where the agent set `skip_reason` or returned `confidence: low`. Surviving runs go to `Store in Queue`, a Code node that pushes the full parsed bundle (companyId, company, score, agent JSON, and all derived fields) into `$workflow.staticData.pending` with a timestamp. Old entries (older than 7 days) are auto-trimmed on each write. The webhook path **ends here** — no Slack post, no HubSpot writeback in real time.
+
+**Monday digest (schedule path).** Every Monday at 9am ET, the `Schedule (Mon 9am ET)` trigger fires (cron `0 9 * * 1`, timezone `America/New_York`). `Read Queue & Top 30` reads `$workflow.staticData.pending`, applies the 7-day TTL filter, sorts by `score` descending, slices the top 30, and removes those entries from the queue. It then emits one item per surviving company in the same shape `Parse Agent Output` produces. Each item flows through `Format Slack Blocks` → `Slack: Post message` → `HubSpot: Update Company`.
+
+**Slack format.** `Format Slack Blocks` builds a Block Kit payload with a header, fields (motion, confidence, product, score), the why-now line, the best-contact section, the reasoning paragraph, the suggested opener, and three action buttons (👍 / 👎 / Open in HubSpot). `Slack: Post message` POSTs to `chat.postMessage`.
 
 **Writeback.** `HubSpot: Update Company` PATCHes four properties on the company record: `last_upsell_alert_sent` (timestamp), `last_upsell_alert_product` (the recommended product), `last_upsell_alert_outcome` (one-line summary, e.g. `cross-sell MEC · medium confidence · 2026-05-19`), and `upsell_alert_count_lifetime` (incremented).
+
+### Why staticData instead of a HubSpot property for the queue
+
+The queue lives in n8n's `$workflow.staticData` — a workflow-scoped persistent object that survives executions and restarts. Two reasons:
+
+- **No new HubSpot property required.** Avoids adding another custom property to the Company object just for queueing.
+- **Self-contained.** The queue is fully owned by this workflow. Easy to inspect via the n8n UI (Code node output panels) and reason about.
+
+Trade-off: the queue isn't visible to CSMs in HubSpot mid-week. If pre-Monday visibility is needed, swap to a multi-line text property like `pending_upsell_signal_json` — same logic, persistent on the company record.
 
 ### Memory model — 1 run back, lives in HubSpot
 
@@ -140,7 +155,10 @@ If `skip_reason` is set or `confidence` is `low`, the workflow short-circuits be
 - **LinkedIn research tool.** Datarails doesn't have approved API access to Tavily/SerpAPI/Apollo for company research; live LinkedIn fetching via Jina was unreliable. Deferred until a vendor is approved.
 - **Salesforce-backed opportunities.** The original design pulled SF Account Owner + Opportunities via SOQL. Currently uses HubSpot deals as a stand-in. Swap to a Salesforce HTTP Request node when SF OAuth credentials are wired.
 - **15-run memory.** Current model stores 1 run back in standard HubSpot properties. Extending to 15 runs requires a new `recent_upsell_signals` multi-line text property on the Company object.
-- **Weekly sweep workflow.** A separate scheduled workflow that runs every Monday morning, lists eligible companies (Active + not signaled in 14 days), scores them, and sends the top 30 to Slack. Design locked, not yet built.
+- **Dedup in queue.** `Store in Queue` currently appends — if a company gets 5 webhook fires in a week, all 5 entries land in the queue. Add a step that replaces the existing entry for the same `companyId` with the latest one.
+- **Quiet-Monday digest.** If the queue is empty on Monday, the schedule path emits 0 items and nothing posts. Optional: post a "0 signals this week" confirmation so the channel knows the sweep ran.
+- **Continue On Fail.** Slack and HubSpot writeback nodes don't have error handling — a single 4xx mid-batch halts the rest of the Monday run. Add `onError: continueRegularOutput` for resilience.
+- **AM-side email drafting (Phase 2).** Auto-draft an outreach email per recommendation, sent on behalf of the assigned AM. Separate workflow, separate planning.
 - **Feedback handler workflow.** The 👍 / 👎 buttons in Slack post to Slack's interactivity endpoint; a separate workflow needs to receive those, write the verdict to the `upsell_signal_feedback` HubSpot property, and (optionally) feed the verdict back into future agent prompts as ground truth.
 
 ### Credentials this workflow needs
