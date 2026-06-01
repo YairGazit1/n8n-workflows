@@ -190,6 +190,14 @@ The instance's Python sandbox is configured with zero allowed stdlib modules (`A
 
 If `skip_reason` is set or `confidence` is `low`, the workflow short-circuits before Slack — the agent's own veto is respected.
 
+### Gotchas & fixes applied
+
+Two bugs surfaced on the first real Monday batch run and have been patched in the workflow:
+
+- **`Format Slack Blocks` collapsed 30 → 1.** The Code node was in "Run Once for All Items" mode but the body read `$json` (first item only) and returned a single-element array. With 30 inputs from `Parse & Top 30`, only the top-scoring company actually rendered and posted. **Fix:** wrap the body in `for (const it of $input.all()) { ... out.push({...}); } return out;` so every queued company gets its own Block Kit payload. Any Code node that consumes multiple items needs this pattern — `$json` alone silently drops the rest.
+
+- **`Parse Agent Output` crashed on numeric `confidence`.** The agent prompt asks for `confidence: "low | medium | high"`, but Gemini occasionally returns a numeric score (e.g. `0.85`). The code called `.toLowerCase()` on it directly, which throws `TypeError: ... is not a function` and kills the webhook execution — that company silently never gets queued. **Fix:** wrap with `String(agent.confidence || 'low').toLowerCase()` in both spots. Treat any agent-supplied field as a possibly-wrong type and coerce.
+
 ### What's deferred
 
 - **AM Slack ID property on HubSpot.** Adding a `am_slack_user_id` text property on the Company and writing the Slack ID into it once would let us skip the runtime Slack `users.list` lookup entirely. More reliable than the case-insensitive name match.
