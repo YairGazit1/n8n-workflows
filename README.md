@@ -198,6 +198,8 @@ Two bugs surfaced on the first real Monday batch run and have been patched in th
 
 - **`Parse Agent Output` crashed on numeric `confidence`.** The agent prompt asks for `confidence: "low | medium | high"`, but Gemini occasionally returns a numeric score (e.g. `0.85`). The code called `.toLowerCase()` on it directly, which throws `TypeError: ... is not a function` and kills the webhook execution — that company silently never gets queued. **Fix:** wrap with `String(agent.confidence || 'low').toLowerCase()` in both spots. Treat any agent-supplied field as a possibly-wrong type and coerce.
 
+- **One bad item halted the Monday batch.** Both `Slack: Post message` and `HubSpot: Update Company` ran without `onError`, so a single 4xx mid-batch (Slack 429 rate limit, HubSpot PATCH on a deleted company, etc.) would stop the workflow and skip every remaining queued company. **Fix:** set `onError: continueRegularOutput` on both nodes. Failed items capture their error and downstream nodes skip them; successful items keep flowing. Visible as a per-item error in the execution view, not a workflow halt.
+
 ### What's deferred
 
 - **AM Slack ID property on HubSpot.** Adding a `am_slack_user_id` text property on the Company and writing the Slack ID into it once would let us skip the runtime Slack `users.list` lookup entirely. More reliable than the case-insensitive name match.
@@ -205,9 +207,7 @@ Two bugs surfaced on the first real Monday batch run and have been patched in th
 - **LinkedIn research tool.** Datarails doesn't have approved API access to Tavily/SerpAPI/Apollo for company research; live LinkedIn fetching via Jina was unreliable. Deferred until a vendor is approved.
 - **Salesforce-backed opportunities.** The original design pulled SF Account Owner + Opportunities via SOQL. Currently uses HubSpot deals as a stand-in. Swap to a Salesforce HTTP Request node when SF OAuth credentials are wired.
 - **15-run memory.** Current model stores 1 run back in standard HubSpot properties. Extending to 15 runs requires a new `recent_upsell_signals` multi-line text property on the Company object.
-- **Dedup in queue.** `Store in Queue` currently appends — if a company gets 5 webhook fires in a week, all 5 entries land in the queue. Add a step that replaces the existing entry for the same `companyId` with the latest one.
 - **Quiet-Monday digest.** If the queue is empty on Monday, the schedule path emits 0 items and nothing posts. Optional: post a "0 signals this week" confirmation so the channel knows the sweep ran.
-- **Continue On Fail.** Slack and HubSpot writeback nodes don't have error handling — a single 4xx mid-batch halts the rest of the Monday run. Add `onError: continueRegularOutput` for resilience.
 - **AM-side email drafting (Phase 2).** Auto-draft an outreach email per recommendation, sent on behalf of the assigned AM. Separate workflow, separate planning.
 - **Feedback handler workflow.** The 👍 / 👎 buttons in Slack post to Slack's interactivity endpoint; a separate workflow needs to receive those, write the verdict to the `upsell_signal_feedback` HubSpot property, and (optionally) feed the verdict back into future agent prompts as ground truth.
 
